@@ -1,0 +1,285 @@
+import kymnasium as kym
+import gymnasium as gym
+import numpy as np
+import pickle
+import os
+
+# 상수 정의
+N = 32
+AGENT_RIGHT, AGENT_DOWN, AGENT_LEFT, AGENT_UP = 1000, 1001, 1002, 1003
+GOAL, LAVA, WALL, FLOOR = 810, 900, 250, 100
+RED_DOORS = [400, 401, 402]
+GREEN_DOORS = [410, 411, 412]
+BLUE_DOORS = [420, 421, 422]
+RED_KEY, GREEN_KEY, BLUE_KEY = 500, 510, 520
+
+# 방향이랑 행동 정의
+DIR = {0: (-1, 0), 1: (0, 1), 2: (1, 0), 3: (0, -1)}
+ACTION_LEFT, ACTION_RIGHT, ACTION_FORWARD, ACTION_PICK, ACTION_DROP, ACTION_OPEN = range(6)
+ACTIONS = [ACTION_LEFT, ACTION_RIGHT, ACTION_FORWARD, ACTION_PICK, ACTION_DROP, ACTION_OPEN]
+
+# 보상 설정
+TURN_COST = -0.05
+MOVE_COST = -0.1
+WALL_PENALTY = -1.0
+PICK_REWARD = 5.0
+OPEN_REWARD = 2.0
+DROP_COST = -0.2
+GOAL_REWARD = 100.0
+LAVA_PENALTY = -100.0
+INVALID_ACTION = -2.0
+GAMMA = 0.99
+
+def encode_keys(r, g, b): return (r << 2) | (g << 1) | b
+def decode_keys(k): return ((k>>2)&1, (k>>1)&1, k&1)
+def encode_state(row, col, ori, k): return (((row*N + col)*4 + ori)*8)+k
+def decode_state(s):
+    k = s%8
+    ori = (s//8)%4
+    col = (s//(8*4))%N
+    row = s//(N*8*4)
+    return row, col, ori, k
+
+def parse_observation(obs):
+    idx = np.where((obs==AGENT_RIGHT)|(obs==AGENT_DOWN)|(obs==AGENT_LEFT)|(obs==AGENT_UP))
+    if len(idx[0])>0:
+        r, c = int(idx[0][0]), int(idx[1][0])
+        ori_map={AGENT_UP:0,AGENT_RIGHT:1,AGENT_DOWN:2,AGENT_LEFT:3}
+        ori = ori_map[int(obs[r,c])]
+    else:
+        r, c, ori = 0, 0, 1
+    return r, c, ori
+
+# 전이 함ㅅ수
+def transition(row, col, ori, key_state, action, env_map):
+    dr, dc = DIR[ori]
+    next_row, next_col, next_ori = row, col, ori
+    reward, done = 0.0, False
+    has_red, has_green, has_blue = decode_keys(key_state)
+
+    if action==ACTION_LEFT:
+        next_ori = (ori-1)%4; reward=TURN_COST
+    elif action==ACTION_RIGHT:
+        next_ori = (ori+1)%4; reward=TURN_COST
+    elif action==ACTION_FORWARD:
+        nr, nc = row+dr, col+dc
+        if not (0<=nr<N and 0<=nc<N): reward=WALL_PENALTY
+        else:
+            tile = env_map[nr, nc]
+            if tile==WALL: reward=WALL_PENALTY
+            elif tile==GOAL: reward, done = GOAL_REWARD, True; next_row, next_col = nr, nc
+            elif tile==LAVA: reward, done = LAVA_PENALTY, True
+            elif tile in RED_DOORS+GREEN_DOORS+BLUE_DOORS: reward=-1.0
+            else: reward=MOVE_COST; next_row, next_col=nr, nc
+    elif action==ACTION_PICK:
+        nr, nc = row+dr, col+dc
+        if 0<=nr<N and 0<=nc<N:
+            tile = env_map[nr, nc]
+            if tile==RED_KEY and not has_red: has_red=1; reward=PICK_REWARD; next_row, next_col=nr,nc; env_map[nr,nc]=FLOOR
+            elif tile==GREEN_KEY and not has_green: has_green=1; reward=PICK_REWARD; next_row, next_col=nr,nc; env_map[nr,nc]=FLOOR
+            elif tile==BLUE_KEY and not has_blue: has_blue=1; reward=PICK_REWARD; next_row, next_col=nr,nc; env_map[nr,nc]=FLOOR
+            else: reward=INVALID_ACTION
+        else: reward=INVALID_ACTION
+    elif action==ACTION_DROP: reward=DROP_COST
+    elif action==ACTION_OPEN:
+        nr, nc = row+dr, col+dc
+        if 0<=nr<N and 0<=nc<N:
+            tile = env_map[nr,nc]; can_open=False
+            if tile in RED_DOORS and has_red: can_open=True; has_red=0
+            elif tile in GREEN_DOORS and has_green: can_open=True; has_green=0
+            elif tile in BLUE_DOORS and has_blue: can_open=True; has_blue=0
+            if can_open: reward=OPEN_REWARD; env_map[nr,nc]=FLOOR; next_row,next_col=nr,nc
+            else: reward=INVALID_ACTION
+        else: reward=INVALID_ACTION
+
+    next_key_state = encode_keys(has_red, has_green, has_blue)
+    next_state = encode_state(next_row, next_col, next_ori, next_key_state)
+    return next_state, reward, done
+
+# 정책 반복
+def modified_policy_iteration(next_states, rewards, dones, terminal_mask, gamma=GAMMA, eval_iters=5, max_iters=100):
+    state_count, action_count = rewards.shape
+    policy = np.full(state_count, ACTION_FORWARD, dtype=np.int8)
+    values = np.zeros(state_count, dtype=np.float32)
+
+    for iteration in range(1, max_iters+1):
+        for _ in range(eval_iters):
+            new_values = values.copy()
+            for s in range(state_count):
+                if terminal_mask[s]: new_values[s]=0.0; continue
+                a = policy[s]; ns = next_states[s,a]
+                new_values[s] = rewards[s,a] + (0 if dones[s,a] else gamma*values[ns])
+            values = new_values
+        stable=True
+        for s in range(state_count):
+            if terminal_mask[s]: continue
+            q = np.zeros(action_count)
+            for a in range(action_count):
+                ns = next_states[s,a]
+                q[a] = rewards[s,a] + (0 if dones[s,a] else gamma*values[ns])
+            best_a = np.argmax(q)
+            if policy[s]!=best_a: policy[s]=best_a; stable=False
+        if stable: break
+    return policy
+
+# agent 클래스
+class Agent(kym.Agent):
+    def __init__(self, PI):
+        self.PI = PI.astype(np.int8)
+        self.key_state = 0
+        self.opened_doors = set()
+        self.pending_turns = []
+        self.collected_keys = set()
+    def save(self, path):
+        with open(path, "wb") as f: pickle.dump(self, f)
+    @classmethod
+    def load(cls, path):
+        with open(path, "rb") as f: return pickle.load(f)
+    def act(self, obs, info): return safe_act(self, obs)
+
+def safe_act(agent, obs):
+    pr, pc, ori = parse_observation(obs)
+    has_red, has_green, has_blue = decode_keys(agent.key_state)
+
+    if not hasattr(agent, "dropped_keys"):
+        agent.dropped_keys = set()  # DROP한 키 위치 기록
+
+    if agent.pending_turns:
+        next_action = agent.pending_turns.pop(0)
+        # PICK 했으면 collected_keys 업데이트
+        if next_action == ACTION_PICK:
+            dr, dc = DIR[ori]
+            nr, nc = pr + dr, pc + dc
+            agent.collected_keys.add((nr, nc))
+        return next_action
+
+    # 앞에 문 확인 및 통과
+    fr, fc = pr + DIR[ori][0], pc + DIR[ori][1]
+    if 0 <= fr < N and 0 <= fc < N:
+        front_tile = obs[fr, fc]
+        can_open = ((front_tile in RED_DOORS and has_red) or
+                    (front_tile in GREEN_DOORS and has_green) or
+                    (front_tile in BLUE_DOORS and has_blue))
+        # 앞에 파란 키가 있고, 녹색 키를 가지고 있을 때
+        if front_tile == BLUE_KEY and not has_blue and has_green:
+            agent.pending_turns = [
+                ACTION_LEFT,        # 왼쪽으로 회전
+                ACTION_DROP,        # 녹색 키 드롭
+                ACTION_RIGHT,       # 원래 방향으로 복귀
+                ACTION_PICK,        # 파란색 키 줍기
+                ACTION_FORWARD      # 앞으로 이동
+            ]
+            agent.key_state = encode_keys(has_red, 0, 1)  # 녹색 키 상태 업데이트
+            agent.dropped_keys.add((pr, pc)) # 현재 위치에 키를 드롭했다고 기록
+            return agent.pending_turns.pop(0)
+
+        # 앞에 빨간 키가 있고, 파란 키를 가지고 있을 때
+        elif front_tile == RED_KEY and not has_red and has_blue:
+            agent.pending_turns = [
+                ACTION_LEFT,        # 왼쪽으로 회전
+                ACTION_DROP,        # 파란색 키 드롭
+                ACTION_RIGHT,       # 원래 방향으로 복귀
+                ACTION_PICK,        # 빨간색 키 줍기
+                ACTION_FORWARD      # 앞으로 이동
+            ]
+            agent.key_state = encode_keys(1, has_green, 0)  # 파란색 키 상태 업데이트
+            agent.dropped_keys.add((pr, pc)) # 현재 위치에 키를 드롭했다고 기록
+            return agent.pending_turns.pop(0)
+
+        elif can_open and (fr, fc) not in agent.opened_doors:
+            # 문 열고 바로 뒤돌아서 DROP + 원래 방향 복귀 + 문 통과 (Forward 두 번)
+            agent.pending_turns = [
+                ACTION_OPEN,                    # 문 열기
+                ACTION_FORWARD, ACTION_FORWARD  # 문 통과 (두 칸 이동)
+            ]
+            return agent.pending_turns.pop(0)
+        
+        agent.opened_doors.add((fr, fc))
+
+        # 키 차감
+        # if front_tile == RED_KEY: has_blue = 0
+        # # elif front_tile in GREEN_KEY: has_green = 0
+        # elif front_tile == BLUE_KEY: has_green = 0
+        # agent.key_state = encode_keys(has_red, has_green, has_blue)
+        
+        # DROP 위치 기록 (문 뒤)
+        # back_r, back_c = pr - DIR[ori][0], pc - DIR[ori][1]
+        # agent.dropped_keys.add((back_r, back_c))
+        # return agent.pending_turns.pop(0)
+
+    # 주변 4방향에서 키 찾기 (PICK + FORWARD)
+    for dir in range(4):
+        dr, dc = DIR[dir]
+        nr, nc = pr + dr, pc + dc
+        if 0 <= nr < N and 0 <= nc < N:
+            if (nr, nc) in agent.collected_keys or (nr, nc) in agent.dropped_keys:
+                continue
+            tile = obs[nr, nc]
+            need_pick = ((tile == RED_KEY and not has_red) or
+                         (tile == GREEN_KEY and not has_green) or
+                         (tile == BLUE_KEY and not has_blue))
+            if need_pick:
+                diff = (dir - ori) % 4
+                if diff == 0: agent.pending_turns = [ACTION_PICK]
+                elif diff == 1: agent.pending_turns = [ACTION_RIGHT, ACTION_PICK]
+                elif diff == 2: agent.pending_turns = [ACTION_RIGHT, ACTION_RIGHT, ACTION_PICK]
+                elif diff == 3: agent.pending_turns = [ACTION_LEFT, ACTION_PICK]
+
+                # 키 상태 업데이트
+                if tile == RED_KEY: has_red = 1
+                elif tile == GREEN_KEY: has_green = 1
+                elif tile == BLUE_KEY: has_blue = 1
+                agent.key_state = encode_keys(has_red, has_green, has_blue)
+                return agent.pending_turns.pop(0)
+
+    # 정책 따라 이동
+    s = encode_state(pr, pc, ori, agent.key_state)
+    return int(agent.PI[s])
+
+# 메인 실행
+if __name__=="__main__":
+    agent_path="agent_v2.pkl"
+    if os.path.exists(agent_path):
+        agent=Agent.load(agent_path)
+    else:
+        env=gym.make(id="kymnasium/GridAdventure-FullMaze-32x32-v0",render_mode=None,bgm=False)
+        obs,_=env.reset(seed=42)
+        env_map=obs.copy()
+        env.close()
+        state_count=N*N*4*8
+        action_count=len(ACTIONS)
+        next_states=np.zeros((state_count,action_count),dtype=np.int32)
+        rewards=np.zeros((state_count,action_count),dtype=np.float32)
+        dones=np.zeros((state_count,action_count),dtype=np.bool_)
+        terminal_mask=np.zeros(state_count,dtype=np.bool_)
+        for s in range(state_count):
+            row,col,ori,key_state=decode_state(s)
+            tile=env_map[row,col]
+            if tile in [WALL,GOAL,LAVA]:
+                terminal_mask[s]=True
+                next_states[s,:]=s
+                dones[s,:]=True
+                continue
+            for a in range(action_count):
+                local_env_copy=env_map.copy()
+                ns,r,d=transition(row,col,ori,key_state,a,local_env_copy)
+                next_states[s,a]=ns
+                rewards[s,a]=r
+                dones[s,a]=d
+        policy=modified_policy_iteration(next_states,rewards,dones,terminal_mask)
+        agent=Agent(policy)
+        agent.save(agent_path)
+
+    test=gym.make(id="kymnasium/GridAdventure-FullMaze-32x32-v0",render_mode="human",bgm=True)
+    obs,info=test.reset(seed=42)
+    done=False; step_count=0; max_steps=2000
+    while not done and step_count < max_steps:
+        action = safe_act(agent, obs)
+        next_obs, reward, terminated, truncated, info = test.step(action)
+        obs = next_obs
+        step_count += 1
+        done = terminated or truncated
+  # 종료 후 창 유지
+    print("도착 완료! 창을 닫으려면 Enter를 누르세요.")
+    input()
+    test.close()
